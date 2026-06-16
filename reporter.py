@@ -35,25 +35,38 @@ class LogReporter(ABC):
 
 class HttpLogReporter(LogReporter):
     """
-    HTTP 日志上报器。
+    HTTP 日志上报器，支持主备多目标地址自动切换。
 
     支持：
-    - 自定义请求头（reporter_headers）
-    - Bearer Token 鉴权（reporter_auth_token）
-    - Basic Auth 鉴权（reporter_basic_auth）
-    - 环境标识（reporter_env）
-    - 连接超时配置
+    - 自定义请求头、Bearer Token、Basic Auth 鉴权
+    - 多目标地址：主地址 + 若干备用地址
+    - 主地址连续失败超过阈值时，自动切到备用地址
+    - 当前地址连续成功 N 次后，尝试切回主地址
+    - 状态可查看：当前地址、切换次数、上次切换时间、恢复进度
 
-    上报失败时，错误信息会包含目标地址和环境标识，
-    方便快速判断是哪个环境的服务出了问题。
+    上报失败时，错误信息会包含目标地址和环境标识。
     """
 
     def __init__(self, config: LogAgentConfig):
-        self._endpoint = config.reporter_endpoint
         self._env = config.reporter_env
         self._timeout_sec = config.reporter_connect_timeout_sec
         self._max_retries = config.reporter_max_retries
         self._retry_backoff_ms = config.reporter_retry_backoff_ms
+
+        self._primary_endpoint = config.reporter_endpoint
+        self._backup_endpoints = list(config.reporter_backup_endpoints or [])
+        self._all_endpoints = [self._primary_endpoint] + self._backup_endpoints
+
+        self._failover_threshold = config.reporter_failover_threshold
+        self._recover_after_success = config.reporter_recover_after_success
+
+        self._current_index = 0
+        self._endpoint_failures = {ep: 0 for ep in self._all_endpoints}
+        self._endpoint_success_streak = {ep: 0 for ep in self._all_endpoints}
+
+        self._switch_count = 0
+        self._last_switch_time = None
+        self._last_switch_reason = ""
 
         self._headers = {
             "Content-Type": "application/json",
@@ -72,15 +85,48 @@ class HttpLogReporter(LogReporter):
             basic_token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
             self._headers["Authorization"] = f"Basic {basic_token}"
 
-        self._simulate_failure = False
+        self._simulate_failure_endpoints: set = set()
+        self._simulate_success_endpoints: set = set()
         self._simulate_delay_ms = 0
 
         self._consecutive_failures = 0
         self._last_failure_reason = ""
 
-    def set_simulate_failure(self, fail: bool):
-        """模拟网络故障，用于测试。"""
-        self._simulate_failure = fail
+    @property
+    def _endpoint(self) -> str:
+        return self._all_endpoints[self._current_index]
+
+    def set_simulate_failure(self, fail: bool, endpoint: Optional[str] = None):
+        """模拟网络故障。endpoint 指定某地址，None 表示全部。"""
+        if endpoint:
+            if fail:
+                self._simulate_failure_endpoints.add(endpoint)
+                self._simulate_success_endpoints.discard(endpoint)
+            else:
+                self._simulate_failure_endpoints.discard(endpoint)
+        else:
+            if fail:
+                for ep in self._all_endpoints:
+                    self._simulate_failure_endpoints.add(ep)
+                    self._simulate_success_endpoints.discard(ep)
+            else:
+                self._simulate_failure_endpoints.clear()
+
+    def set_simulate_success(self, succeed: bool, endpoint: Optional[str] = None):
+        """模拟上报成功（跳过真实HTTP）。endpoint 指定某地址，None 表示全部。"""
+        if endpoint:
+            if succeed:
+                self._simulate_success_endpoints.add(endpoint)
+                self._simulate_failure_endpoints.discard(endpoint)
+            else:
+                self._simulate_success_endpoints.discard(endpoint)
+        else:
+            if succeed:
+                for ep in self._all_endpoints:
+                    self._simulate_success_endpoints.add(ep)
+                    self._simulate_failure_endpoints.discard(ep)
+            else:
+                self._simulate_success_endpoints.clear()
 
     def set_simulate_delay(self, delay_ms: int):
         """模拟网络延迟。"""
@@ -93,35 +139,72 @@ class HttpLogReporter(LogReporter):
             for k, v in self._headers.items()
         }
         return {
-            "endpoint": self._endpoint,
+            "current_endpoint": self._endpoint,
+            "current_endpoint_role": "primary" if self._current_index == 0 else f"backup#{self._current_index}",
+            "primary_endpoint": self._primary_endpoint,
+            "all_endpoints": self._all_endpoints,
             "env": self._env,
             "timeout_sec": self._timeout_sec,
             "headers": headers_safe,
             "consecutive_failures": self._consecutive_failures,
             "last_failure_reason": self._last_failure_reason,
+            "failover": {
+                "switch_count": self._switch_count,
+                "last_switch_time": self._last_switch_time,
+                "last_switch_reason": self._last_switch_reason,
+                "threshold": self._failover_threshold,
+                "recover_success_needed": self._recover_after_success,
+                "per_endpoint_failures": dict(self._endpoint_failures),
+                "per_endpoint_success_streak": dict(self._endpoint_success_streak),
+            },
         }
 
     def report(self, entries: List[LogEntry]) -> bool:
         """
         上报一批日志。
 
-        真实发送 HTTP POST 请求，Content-Type: application/json。
-        返回 True 表示上报成功，False 表示失败。
+        流程：
+        1. 尝试当前地址
+        2. 如果失败次数超过阈值，且有备用地址，则切换
+        3. 当前地址连续成功足够次数后，尝试切回主地址
         """
         if self._simulate_delay_ms > 0:
             time.sleep(self._simulate_delay_ms / 1000.0)
 
-        if self._simulate_failure:
-            self._record_failure("simulated failure")
+        endpoint = self._endpoint
+        success = self._try_report(endpoint, entries)
+
+        if success:
+            self._consecutive_failures = 0
+            self._last_failure_reason = ""
+            self._endpoint_failures[endpoint] = 0
+            self._endpoint_success_streak[endpoint] = self._endpoint_success_streak.get(endpoint, 0) + 1
+
+            self._try_recover_to_primary()
+
+            return True
+
+        self._record_failure(endpoint, self._last_failure_reason or "unknown")
+
+        self._maybe_failover()
+
+        return False
+
+    def _try_report(self, endpoint: str, entries: List[LogEntry]) -> bool:
+        """尝试向指定地址上报一次。"""
+        if endpoint in self._simulate_success_endpoints:
+            return True
+        if endpoint in self._simulate_failure_endpoints:
+            self._last_failure_reason = "simulated failure"
             return False
 
-        target_info = f"[env={self._env}] {self._endpoint}"
+        target_info = f"[env={self._env}] {endpoint}"
 
         try:
             payload = json.dumps([e.to_dict() for e in entries]).encode("utf-8")
 
             req = urllib.request.Request(
-                self._endpoint,
+                endpoint,
                 data=payload,
                 method="POST",
                 headers=self._headers,
@@ -130,34 +213,82 @@ class HttpLogReporter(LogReporter):
             with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
                 status = resp.getcode()
                 if 200 <= status < 300:
-                    self._consecutive_failures = 0
-                    self._last_failure_reason = ""
                     return True
                 else:
-                    reason = f"HTTP {status}"
-                    self._record_failure(reason)
+                    self._last_failure_reason = f"HTTP {status}"
                     logger.warning(f"report failed {target_info}: HTTP {status}")
                     return False
 
         except urllib.error.HTTPError as e:
             reason = f"HTTP {e.code}: {e.reason}"
-            self._record_failure(reason)
+            self._last_failure_reason = reason
             logger.warning(f"report failed {target_info}: {reason}")
             return False
         except urllib.error.URLError as e:
             reason = f"URL Error: {e.reason}"
-            self._record_failure(reason)
+            self._last_failure_reason = reason
             logger.warning(f"report failed {target_info}: {reason}")
             return False
         except Exception as e:
             reason = f"Unexpected: {type(e).__name__}: {e}"
-            self._record_failure(reason)
+            self._last_failure_reason = reason
             logger.error(f"report failed {target_info}: {reason}")
             return False
 
-    def _record_failure(self, reason: str):
+    def _record_failure(self, endpoint: str, reason: str):
         self._consecutive_failures += 1
-        self._last_failure_reason = reason
+        self._endpoint_failures[endpoint] = self._endpoint_failures.get(endpoint, 0) + 1
+        self._endpoint_success_streak[endpoint] = 0
+
+    def _maybe_failover(self):
+        """当前地址失败太多时，切换到下一个可用地址。"""
+        if self._consecutive_failures < self._failover_threshold:
+            return
+
+        if len(self._all_endpoints) <= 1:
+            return
+
+        old_index = self._current_index
+        new_index = (self._current_index + 1) % len(self._all_endpoints)
+
+        attempts = 0
+        while new_index != old_index and attempts < len(self._all_endpoints):
+            if self._endpoint_failures.get(self._all_endpoints[new_index], 0) < self._failover_threshold:
+                break
+            new_index = (new_index + 1) % len(self._all_endpoints)
+            attempts += 1
+
+        if new_index != old_index:
+            self._current_index = new_index
+            self._switch_count += 1
+            self._last_switch_time = time.time()
+            self._last_switch_reason = f"consecutive failures reached {self._failover_threshold}"
+            self._consecutive_failures = 0
+            logger.warning(
+                f"failover: switched endpoint from "
+                f"{self._all_endpoints[old_index]} to {self._all_endpoints[new_index]} "
+                f"(reason: {self._last_switch_reason})"
+            )
+
+    def _try_recover_to_primary(self):
+        """当前地址（非主）连续成功足够次数后，尝试切回主地址。"""
+        if self._current_index == 0:
+            return
+
+        current_ep = self._endpoint
+        streak = self._endpoint_success_streak.get(current_ep, 0)
+
+        if streak >= self._recover_after_success:
+            old_ep = current_ep
+            self._current_index = 0
+            self._switch_count += 1
+            self._last_switch_time = time.time()
+            self._last_switch_reason = f"backup had {streak} consecutive successes, recovering to primary"
+            self._consecutive_failures = 0
+            logger.info(
+                f"failover: recovered to primary {self._primary_endpoint} "
+                f"from {old_ep} (after {streak} successes)"
+            )
 
     def close(self):
         pass
@@ -174,6 +305,13 @@ class ConsoleLogReporter(LogReporter):
     @property
     def count(self) -> int:
         return self._count
+
+    def get_target_info(self) -> dict:
+        return {
+            "type": "console",
+            "current_endpoint": "stdout",
+            "reported_count": self._count,
+        }
 
     def report(self, entries: List[LogEntry]) -> bool:
         for entry in entries:

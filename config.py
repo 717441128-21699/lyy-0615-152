@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import time
 
 
@@ -16,6 +16,12 @@ class LogAgentConfig:
     reporter_type: str = "http"
 
     reporter_endpoint: str = "http://localhost:8080/logs"
+
+    reporter_backup_endpoints: List[str] = field(default_factory=list)
+
+    reporter_failover_threshold: int = 5
+
+    reporter_recover_after_success: int = 10
 
     reporter_env: str = "default"
 

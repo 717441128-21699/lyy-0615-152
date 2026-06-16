@@ -3,14 +3,27 @@ import time
 import logging
 import json
 import os
+import sys
 from typing import Optional, List
 
 from ring_buffer import RingBuffer
 from config import LogAgentConfig, LogEntry
 from reporter import ReporterWorker, HttpLogReporter, ConsoleLogReporter, LogReporter
 from crash_protector import CrashProtector
+from sample_controller import SampleController
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_print(msg: str = ""):
+    """兼容 Windows GBK 终端的打印函数。"""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        try:
+            print(msg.encode("utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace"))
+        except Exception:
+            pass
 
 
 class LogAgent:
@@ -48,10 +61,13 @@ class LogAgent:
 
         self._crash_protector = CrashProtector(dump_dir=self._config.crash_dump_dir)
 
+        self._sample_controller = SampleController()
+
         self._started = False
         self._start_lock = threading.Lock()
 
         self._write_count = 0
+        self._sample_hit_count = 0
         self._stats_lock = threading.Lock()
 
     def _create_reporter(self) -> LogReporter:
@@ -118,8 +134,9 @@ class LogAgent:
 
         Returns:
             "success" - 写入成功
-            "dropped" - 被丢弃（缓冲区满）
+            "dropped" - 被丢弃（缓冲区满 或 采样过滤）
             "timeout" - 阻塞等待超时（仅 BLOCK + block=True 时可能返回）
+            "sampled_out" - 被采样规则过滤（级别太低 / 采样未命中）
         """
         entry = LogEntry(
             level=level,
@@ -129,6 +146,12 @@ class LogAgent:
             service=service or self._config.service if hasattr(self._config, 'service') else "default",
         )
 
+        keep, _reason = self._sample_controller.should_keep(entry)
+        if not keep:
+            with self._stats_lock:
+                self._sample_hit_count += 1
+            return "sampled_out"
+
         result = self._buffer.put(entry, block=block, timeout=timeout)
 
         if result == RingBuffer.PUT_SUCCESS:
@@ -136,6 +159,11 @@ class LogAgent:
                 self._write_count += 1
 
         return result
+
+    @property
+    def sampler(self) -> SampleController:
+        """访问采样控制器，用于动态调整日志级别和采样率。"""
+        return self._sample_controller
 
     def debug(self, message: str, **kwargs):
         return self.log("DEBUG", message, **kwargs)
@@ -221,6 +249,7 @@ class LogAgent:
                 "qps_recent": qps_recent,
                 "qps_avg": rate_stats.get("qps_avg", 0),
             },
+            "sampling": self._sample_controller.get_stats(),
             "backlog": {
                 "total": backlog,
                 "in_buffer": rate_stats.get("pending_in_buffer", 0),
@@ -251,7 +280,7 @@ class LogAgent:
         """
         s = self.get_status()
 
-        running = "✅ RUNNING" if s["running"] else "⏹  STOPPED"
+        running = "[OK] RUNNING" if s["running"] else "[--] STOPPED"
         uptime = s["uptime_sec"]
         if uptime >= 60:
             uptime_str = f"{uptime/60:.1f} 分钟"
@@ -263,7 +292,7 @@ class LogAgent:
         if target:
             target_desc = f"[{target.get('env', '?')}] {target.get('endpoint', '?')}"
             if target.get("consecutive_failures", 0) > 0:
-                target_desc += f"  ⚠ 连续失败 {target['consecutive_failures']} 次"
+                target_desc += f"  [!] 连续失败 {target['consecutive_failures']} 次"
 
         buf_size = s["buffer"]["size"]
         buf_cap = s["buffer"]["capacity"]
@@ -281,40 +310,41 @@ class LogAgent:
             else:
                 drain_str = f" (预计 {drain_est} 秒排空)"
 
-        print()
-        print("┌" + "─" * 78 + "┐")
-        print(f"│  LogAgent 运行状态   {running:<30}   运行时长: {uptime_str:<15}│")
-        print(f"│  上报目标: {target_desc:<67}│")
-        print("├" + "─" * 78 + "┤")
-        print(f"│  📦 缓冲区                          │  📊 吞吐")
-        print(f"│     容量: {buf_cap:<10,}              │     累计写入: {s['throughput']['total_written']:>12,}")
-        print(f"│     已用: {buf_size:<10,}              │     累计上报: {s['throughput']['total_reported']:>12,}")
-        print(f"│     使用率: {buf_bar} {buf_pct:>5.1f}%     │     近期 QPS: {qps:>12,.1f}")
-        print(f"│                                     │     平均 QPS: {s['throughput']['qps_avg']:>12,.1f}")
-        print("├" + "─" * 78 + "┤")
-        print(f"│  ⏳ 积压日志                        │  ⚠ 异常")
-        print(f"│     总数: {backlog:<10,}  {drain_str:<20}│     溢出次数: {s['errors']['overflow_count']:>10,}")
-        print(f"│     缓冲区内: {s['backlog']['in_buffer']:<8,}            │     丢弃总数: {s['errors']['total_dropped']:>10,}")
-        print(f"│     重试中:   {s['backlog']['in_retry']:<8,}            │       丢最老: {s['errors']['dropped_oldest']:>10,}")
-        print(f"│                                     │       丢最新: {s['errors']['dropped_newest']:>10,}")
-        print(f"│                                     │     重试次数: {s['errors']['total_retries']:>10,}")
-        print(f"│                                     │     上报失败: {s['throughput']['total_failed']:>10,}")
-        print("└" + "─" * 78 + "┘")
+        _safe_print()
+        _safe_print("┌" + "─" * 78 + "┐")
+        _safe_print(f"│  LogAgent 运行状态   {running:<30}   运行时长: {uptime_str:<15}│")
+        _safe_print(f"│  上报目标: {target_desc:<67}│")
+        _safe_print("├" + "─" * 78 + "┤")
+        _safe_print(f"│  [buffer] 缓冲区                     │  [thrpt] 吞吐")
+        _safe_print(f"│     容量: {buf_cap:<10,}              │     累计写入: {s['throughput']['total_written']:>12,}")
+        _safe_print(f"│     已用: {buf_size:<10,}              │     累计上报: {s['throughput']['total_reported']:>12,}")
+        _safe_print(f"│     使用率: {buf_bar} {buf_pct:>5.1f}%     │     近期 QPS: {qps:>12,.1f}")
+        _safe_print(f"│                                     │     平均 QPS: {s['throughput']['qps_avg']:>12,.1f}")
+        _safe_print("├" + "─" * 78 + "┤")
+        _safe_print(f"│  [queued] 积压日志                    │  [error] 异常")
+        _safe_print(f"│     总数: {backlog:<10,}  {drain_str:<20}│     溢出次数: {s['errors']['overflow_count']:>10,}")
+        _safe_print(f"│     缓冲区内: {s['backlog']['in_buffer']:<8,}            │     丢弃总数: {s['errors']['total_dropped']:>10,}")
+        _safe_print(f"│     重试中:   {s['backlog']['in_retry']:<8,}            │       丢最老: {s['errors']['dropped_oldest']:>10,}")
+        _safe_print(f"│                                     │       丢最新: {s['errors']['dropped_newest']:>10,}")
+        _safe_print(f"│                                     │     重试次数: {s['errors']['total_retries']:>10,}")
+        _safe_print(f"│                                     │     上报失败: {s['throughput']['total_failed']:>10,}")
+        _safe_print("└" + "─" * 78 + "┘")
 
         if buf_pct > 80:
-            print("  ⚠  缓冲区使用率超过 80%，建议：")
-            print("     - 扩容缓冲区容量 (buffer_capacity)")
-            print("     - 加快上报速度 (reporter_flush_interval_ms)")
-            print("     - 增加上报批量大小 (reporter_batch_size)")
+            _safe_print("  [!] 缓冲区使用率超过 80%，建议：")
+            _safe_print("     - 扩容缓冲区容量 (buffer_capacity)")
+            _safe_print("     - 加快上报速度 (reporter_flush_interval_ms)")
+            _safe_print("     - 增加上报批量大小 (reporter_batch_size)")
         elif backlog > 1000 and qps < 100:
-            print("  ⚠  积压严重但上报速度慢，建议检查网络或日志服务")
+            _safe_print("  [!] 积压严重但上报速度慢，建议检查网络或日志服务")
 
-        print()
+        _safe_print()
 
     def query_logs(self, level: Optional[str] = None,
                    keyword: Optional[str] = None,
                    trace_id: Optional[str] = None,
-                   limit: int = 100) -> List[dict]:
+                   limit: int = 100,
+                   order: str = "desc") -> List[dict]:
         """
         本地查询尚未上报的日志，用于快速排查问题。
 
@@ -325,16 +355,22 @@ class LogAgent:
             keyword: 按消息内容关键词过滤（大小写不敏感）
             trace_id: 按 trace_id 精确匹配
             limit: 最多返回多少条，默认 100 条
+            order: 排序方式
+                   "desc" - 从新到旧（默认，优先看最新日志）
+                   "asc"  - 从旧到新（按时间线排查）
 
         Returns:
-            符合条件的日志字典列表，按时间从新到旧排序
+            符合条件的日志字典列表，按指定顺序排序
         """
+        if order not in ("asc", "desc"):
+            raise ValueError("order must be 'asc' or 'desc'")
+
         entries = self._reporter_worker.peek_all_pending()
 
         level_upper = level.upper() if level else None
         keyword_lower = keyword.lower() if keyword else None
 
-        results = []
+        all_matched = []
         for entry in entries:
             if level_upper and entry.level.upper() != level_upper:
                 continue
@@ -345,31 +381,36 @@ class LogAgent:
             if trace_id and entry.trace_id != trace_id:
                 continue
 
-            results.append(entry.to_dict())
+            all_matched.append(entry.to_dict())
 
-            if len(results) >= limit:
-                break
+        if order == "desc":
+            all_matched.reverse()
 
-        return results
+        if len(all_matched) > limit:
+            all_matched = all_matched[:limit]
+
+        return all_matched
 
     def print_logs(self, level: Optional[str] = None,
                    keyword: Optional[str] = None,
                    trace_id: Optional[str] = None,
-                   limit: int = 50):
+                   limit: int = 50,
+                   order: str = "desc"):
         """
         打印查询到的日志到控制台，方便快速查看。
         参数同 query_logs。
         """
         logs = self.query_logs(level=level, keyword=keyword,
-                               trace_id=trace_id, limit=limit)
+                               trace_id=trace_id, limit=limit, order=order)
 
         if not logs:
-            print("(没有符合条件的未上报日志)")
+            _safe_print("(没有符合条件的未上报日志)")
             return
 
-        print(f"┌── 未上报日志查询结果（共 {len(logs)} 条）")
-        print(f"│   过滤条件: level={level}, keyword={keyword}, trace_id={trace_id}")
-        print(f"├{'─' * 100}")
+        order_label = "从新到旧" if order == "desc" else "从旧到新"
+        _safe_print(f"┌── 未上报日志查询结果（共 {len(logs)} 条，排序: {order_label}）")
+        _safe_print(f"│   过滤条件: level={level}, keyword={keyword}, trace_id={trace_id}")
+        _safe_print(f"├{'─' * 100}")
 
         for i, log in enumerate(logs):
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log["timestamp"]))
@@ -377,9 +418,9 @@ class LogAgent:
             msg = log["message"]
             if len(msg) > 80:
                 msg = msg[:77] + "..."
-            print(f"│ [{log['level']:<8}] {ts}  trace={trace:<12}  {msg}")
+            _safe_print(f"│ [{log['level']:<8}] {ts}  trace={trace:<12}  {msg}")
 
-        print(f"└{'─' * 100}")
+        _safe_print(f"└{'─' * 100}")
 
     def export_diagnostic_data(self, output_dir: Optional[str] = None,
                                include_crash_dumps: bool = True) -> str:
