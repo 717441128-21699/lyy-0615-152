@@ -37,24 +37,46 @@ class HttpLogReporter(LogReporter):
     """
     HTTP 日志上报器。
 
-    将批量日志以 JSON 数组形式 POST 到配置的 HTTP 端点。
-    请求体格式：
-    [
-      {"level": "INFO", "message": "...", "timestamp": 1234567890, ...},
-      ...
-    ]
+    支持：
+    - 自定义请求头（reporter_headers）
+    - Bearer Token 鉴权（reporter_auth_token）
+    - Basic Auth 鉴权（reporter_basic_auth）
+    - 环境标识（reporter_env）
+    - 连接超时配置
 
-    支持真实网络故障模拟，便于测试。
+    上报失败时，错误信息会包含目标地址和环境标识，
+    方便快速判断是哪个环境的服务出了问题。
     """
 
     def __init__(self, config: LogAgentConfig):
         self._endpoint = config.reporter_endpoint
-        self._timeout_sec = 5.0
+        self._env = config.reporter_env
+        self._timeout_sec = config.reporter_connect_timeout_sec
         self._max_retries = config.reporter_max_retries
         self._retry_backoff_ms = config.reporter_retry_backoff_ms
 
+        self._headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"log-agent/1.0 (env={self._env})",
+        }
+
+        if config.reporter_headers:
+            self._headers.update(config.reporter_headers)
+
+        if config.reporter_auth_token:
+            self._headers["Authorization"] = f"Bearer {config.reporter_auth_token}"
+
+        if config.reporter_basic_auth:
+            import base64
+            user, pwd = config.reporter_basic_auth
+            basic_token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+            self._headers["Authorization"] = f"Basic {basic_token}"
+
         self._simulate_failure = False
         self._simulate_delay_ms = 0
+
+        self._consecutive_failures = 0
+        self._last_failure_reason = ""
 
     def set_simulate_failure(self, fail: bool):
         """模拟网络故障，用于测试。"""
@@ -63,6 +85,21 @@ class HttpLogReporter(LogReporter):
     def set_simulate_delay(self, delay_ms: int):
         """模拟网络延迟。"""
         self._simulate_delay_ms = delay_ms
+
+    def get_target_info(self) -> dict:
+        """获取上报目标信息，出问题时快速识别是哪个目标。"""
+        headers_safe = {
+            k: (v if k.lower() != "authorization" else "***")
+            for k, v in self._headers.items()
+        }
+        return {
+            "endpoint": self._endpoint,
+            "env": self._env,
+            "timeout_sec": self._timeout_sec,
+            "headers": headers_safe,
+            "consecutive_failures": self._consecutive_failures,
+            "last_failure_reason": self._last_failure_reason,
+        }
 
     def report(self, entries: List[LogEntry]) -> bool:
         """
@@ -75,7 +112,10 @@ class HttpLogReporter(LogReporter):
             time.sleep(self._simulate_delay_ms / 1000.0)
 
         if self._simulate_failure:
+            self._record_failure("simulated failure")
             return False
+
+        target_info = f"[env={self._env}] {self._endpoint}"
 
         try:
             payload = json.dumps([e.to_dict() for e in entries]).encode("utf-8")
@@ -84,29 +124,40 @@ class HttpLogReporter(LogReporter):
                 self._endpoint,
                 data=payload,
                 method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "log-agent/1.0",
-                },
+                headers=self._headers,
             )
 
             with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
-                    status = resp.getcode()
-                    if 200 <= status < 300:
-                        return True
-                    else:
-                        logger.warning(f"http report got status {status}")
-                        return False
+                status = resp.getcode()
+                if 200 <= status < 300:
+                    self._consecutive_failures = 0
+                    self._last_failure_reason = ""
+                    return True
+                else:
+                    reason = f"HTTP {status}"
+                    self._record_failure(reason)
+                    logger.warning(f"report failed {target_info}: HTTP {status}")
+                    return False
 
         except urllib.error.HTTPError as e:
-            logger.warning(f"http report HTTP error: {e.code} {e.reason}")
+            reason = f"HTTP {e.code}: {e.reason}"
+            self._record_failure(reason)
+            logger.warning(f"report failed {target_info}: {reason}")
             return False
         except urllib.error.URLError as e:
-            logger.warning(f"http report URL error: {e.reason}")
+            reason = f"URL Error: {e.reason}"
+            self._record_failure(reason)
+            logger.warning(f"report failed {target_info}: {reason}")
             return False
         except Exception as e:
-            logger.error(f"http report unexpected error: {e}")
+            reason = f"Unexpected: {type(e).__name__}: {e}"
+            self._record_failure(reason)
+            logger.error(f"report failed {target_info}: {reason}")
             return False
+
+    def _record_failure(self, reason: str):
+        self._consecutive_failures += 1
+        self._last_failure_reason = reason
 
     def close(self):
         pass
@@ -166,6 +217,10 @@ class ReporterWorker:
 
         self._stats_lock = threading.Lock()
 
+        self._start_time = time.time()
+        self._recent_reports = []
+        self._recent_window_sec = 60.0
+
     def start(self):
         """启动上报线程。"""
         if self._thread and self._thread.is_alive():
@@ -216,6 +271,11 @@ class ReporterWorker:
                 if success:
                     with self._stats_lock:
                         self._reported_count += len(entries)
+                        now = time.time()
+                        self._recent_reports.append((now, len(entries)))
+                        cutoff = now - self._recent_window_sec
+                        while self._recent_reports and self._recent_reports[0][0] < cutoff:
+                            self._recent_reports.pop(0)
                     return
 
                 retries += 1
@@ -279,10 +339,66 @@ class ReporterWorker:
 
         return all_entries
 
+    def peek_all_pending(self) -> List[LogEntry]:
+        """
+        只读查看所有待处理的日志，不移除。
+
+        用于本地查询、问题排查。
+        """
+        all_entries = []
+
+        with self._pending_lock:
+            all_entries.extend(list(self._pending_entries))
+
+        buffer_entries = self._buffer.peek()
+        all_entries.extend(buffer_entries)
+
+        return all_entries
+
     def get_stats(self) -> dict:
         with self._stats_lock:
             return {
                 "reported_count": self._reported_count,
                 "failed_count": self._failed_count,
                 "retry_count": self._retry_count,
+            }
+
+    def get_rate_stats(self) -> dict:
+        """获取上报速率统计。"""
+        now = time.time()
+        with self._stats_lock:
+            cutoff = now - self._recent_window_sec
+            while self._recent_reports and self._recent_reports[0][0] < cutoff:
+                self._recent_reports.pop(0)
+
+            total_recent = sum(count for _, count in self._recent_reports)
+
+            if len(self._recent_reports) >= 2:
+                time_span = self._recent_reports[-1][0] - self._recent_reports[0][0]
+                if time_span > 0:
+                    qps = total_recent / time_span
+                else:
+                    qps = 0.0
+            else:
+                qps = 0.0
+
+            avg_qps = self._reported_count / (now - self._start_time) if now > self._start_time else 0.0
+
+            pending_in_buffer = len(self._buffer)
+            with self._pending_lock:
+                pending_in_retry = len(self._pending_entries)
+
+            total_pending = pending_in_buffer + pending_in_retry
+
+            return {
+                "qps_recent": round(qps, 2),
+                "qps_avg": round(avg_qps, 2),
+                "total_reported": self._reported_count,
+                "total_failed": self._failed_count,
+                "total_retries": self._retry_count,
+                "pending_in_buffer": pending_in_buffer,
+                "pending_in_retry": pending_in_retry,
+                "total_pending": total_pending,
+                "window_sec": self._recent_window_sec,
+                "uptime_sec": round(now - self._start_time, 1),
             }

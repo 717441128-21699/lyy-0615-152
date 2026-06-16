@@ -1,7 +1,9 @@
 import threading
 import time
 import logging
-from typing import Optional
+import json
+import os
+from typing import Optional, List
 
 from ring_buffer import RingBuffer
 from config import LogAgentConfig, LogEntry
@@ -178,6 +180,295 @@ class LogAgent:
             "buffer": buffer_stats,
             "reporter": reporter_stats,
         }
+
+    def get_status(self) -> dict:
+        """
+        获取完整的运行状态，包括上报速率、积压量、重试次数等。
+
+        适合压测时监控、判断是否需要扩容。
+        """
+        rate_stats = self._reporter_worker.get_rate_stats()
+        buffer_stats = self._buffer.get_stats()
+
+        with self._stats_lock:
+            write_count = self._write_count
+
+        dropped_total = (buffer_stats.get("dropped_oldest_count", 0)
+                        + buffer_stats.get("dropped_newest_count", 0))
+
+        backlog = rate_stats.get("total_pending", 0)
+        qps_recent = rate_stats.get("qps_recent", 0)
+        buffer_capacity = buffer_stats.get("capacity", 1)
+        buffer_usage_pct = (buffer_stats.get("size", 0) / buffer_capacity * 100)
+
+        target_info = None
+        if hasattr(self._reporter, "get_target_info"):
+            target_info = self._reporter.get_target_info()
+
+        status = {
+            "running": self._started,
+            "uptime_sec": rate_stats.get("uptime_sec", 0),
+            "overflow_strategy": buffer_stats.get("overflow_strategy"),
+            "buffer": {
+                "capacity": buffer_capacity,
+                "size": buffer_stats.get("size", 0),
+                "usage_pct": round(buffer_usage_pct, 1),
+            },
+            "throughput": {
+                "total_written": write_count,
+                "total_reported": rate_stats.get("total_reported", 0),
+                "total_failed": rate_stats.get("total_failed", 0),
+                "qps_recent": qps_recent,
+                "qps_avg": rate_stats.get("qps_avg", 0),
+            },
+            "backlog": {
+                "total": backlog,
+                "in_buffer": rate_stats.get("pending_in_buffer", 0),
+                "in_retry": rate_stats.get("pending_in_retry", 0),
+            },
+            "errors": {
+                "total_dropped": dropped_total,
+                "dropped_oldest": buffer_stats.get("dropped_oldest_count", 0),
+                "dropped_newest": buffer_stats.get("dropped_newest_count", 0),
+                "overflow_count": buffer_stats.get("overflow_count", 0),
+                "total_retries": rate_stats.get("total_retries", 0),
+            },
+            "target": target_info,
+        }
+
+        if qps_recent > 0 and backlog > 1000:
+            estimate_sec = round(backlog / qps_recent, 1)
+            status["backlog"]["drain_estimate_sec"] = estimate_sec
+
+        return status
+
+    def print_status(self):
+        """
+        以直观的表格形式打印运行状态。
+
+        包含：积压量、上报速度、重试次数、丢弃量、缓冲区使用率。
+        压测时可以直接调用此方法判断是否需要扩容。
+        """
+        s = self.get_status()
+
+        running = "✅ RUNNING" if s["running"] else "⏹  STOPPED"
+        uptime = s["uptime_sec"]
+        if uptime >= 60:
+            uptime_str = f"{uptime/60:.1f} 分钟"
+        else:
+            uptime_str = f"{uptime:.1f} 秒"
+
+        target = s.get("target", {})
+        target_desc = "N/A"
+        if target:
+            target_desc = f"[{target.get('env', '?')}] {target.get('endpoint', '?')}"
+            if target.get("consecutive_failures", 0) > 0:
+                target_desc += f"  ⚠ 连续失败 {target['consecutive_failures']} 次"
+
+        buf_size = s["buffer"]["size"]
+        buf_cap = s["buffer"]["capacity"]
+        buf_pct = s["buffer"]["usage_pct"]
+        buf_bar = "█" * int(buf_pct / 10) + "░" * (10 - int(buf_pct / 10))
+
+        qps = s["throughput"]["qps_recent"]
+        backlog = s["backlog"]["total"]
+        drain_est = s["backlog"].get("drain_estimate_sec", None)
+
+        drain_str = ""
+        if drain_est is not None:
+            if drain_est > 60:
+                drain_str = f" (预计 {drain_est/60:.1f} 分钟排空)"
+            else:
+                drain_str = f" (预计 {drain_est} 秒排空)"
+
+        print()
+        print("┌" + "─" * 78 + "┐")
+        print(f"│  LogAgent 运行状态   {running:<30}   运行时长: {uptime_str:<15}│")
+        print(f"│  上报目标: {target_desc:<67}│")
+        print("├" + "─" * 78 + "┤")
+        print(f"│  📦 缓冲区                          │  📊 吞吐")
+        print(f"│     容量: {buf_cap:<10,}              │     累计写入: {s['throughput']['total_written']:>12,}")
+        print(f"│     已用: {buf_size:<10,}              │     累计上报: {s['throughput']['total_reported']:>12,}")
+        print(f"│     使用率: {buf_bar} {buf_pct:>5.1f}%     │     近期 QPS: {qps:>12,.1f}")
+        print(f"│                                     │     平均 QPS: {s['throughput']['qps_avg']:>12,.1f}")
+        print("├" + "─" * 78 + "┤")
+        print(f"│  ⏳ 积压日志                        │  ⚠ 异常")
+        print(f"│     总数: {backlog:<10,}  {drain_str:<20}│     溢出次数: {s['errors']['overflow_count']:>10,}")
+        print(f"│     缓冲区内: {s['backlog']['in_buffer']:<8,}            │     丢弃总数: {s['errors']['total_dropped']:>10,}")
+        print(f"│     重试中:   {s['backlog']['in_retry']:<8,}            │       丢最老: {s['errors']['dropped_oldest']:>10,}")
+        print(f"│                                     │       丢最新: {s['errors']['dropped_newest']:>10,}")
+        print(f"│                                     │     重试次数: {s['errors']['total_retries']:>10,}")
+        print(f"│                                     │     上报失败: {s['throughput']['total_failed']:>10,}")
+        print("└" + "─" * 78 + "┘")
+
+        if buf_pct > 80:
+            print("  ⚠  缓冲区使用率超过 80%，建议：")
+            print("     - 扩容缓冲区容量 (buffer_capacity)")
+            print("     - 加快上报速度 (reporter_flush_interval_ms)")
+            print("     - 增加上报批量大小 (reporter_batch_size)")
+        elif backlog > 1000 and qps < 100:
+            print("  ⚠  积压严重但上报速度慢，建议检查网络或日志服务")
+
+        print()
+
+    def query_logs(self, level: Optional[str] = None,
+                   keyword: Optional[str] = None,
+                   trace_id: Optional[str] = None,
+                   limit: int = 100) -> List[dict]:
+        """
+        本地查询尚未上报的日志，用于快速排查问题。
+
+        只读操作，不会影响日志上报流程。
+
+        Args:
+            level: 按级别过滤，如 "ERROR"、"WARN"；None 表示所有级别
+            keyword: 按消息内容关键词过滤（大小写不敏感）
+            trace_id: 按 trace_id 精确匹配
+            limit: 最多返回多少条，默认 100 条
+
+        Returns:
+            符合条件的日志字典列表，按时间从新到旧排序
+        """
+        entries = self._reporter_worker.peek_all_pending()
+
+        level_upper = level.upper() if level else None
+        keyword_lower = keyword.lower() if keyword else None
+
+        results = []
+        for entry in entries:
+            if level_upper and entry.level.upper() != level_upper:
+                continue
+
+            if keyword_lower and keyword_lower not in entry.message.lower():
+                continue
+
+            if trace_id and entry.trace_id != trace_id:
+                continue
+
+            results.append(entry.to_dict())
+
+            if len(results) >= limit:
+                break
+
+        return results
+
+    def print_logs(self, level: Optional[str] = None,
+                   keyword: Optional[str] = None,
+                   trace_id: Optional[str] = None,
+                   limit: int = 50):
+        """
+        打印查询到的日志到控制台，方便快速查看。
+        参数同 query_logs。
+        """
+        logs = self.query_logs(level=level, keyword=keyword,
+                               trace_id=trace_id, limit=limit)
+
+        if not logs:
+            print("(没有符合条件的未上报日志)")
+            return
+
+        print(f"┌── 未上报日志查询结果（共 {len(logs)} 条）")
+        print(f"│   过滤条件: level={level}, keyword={keyword}, trace_id={trace_id}")
+        print(f"├{'─' * 100}")
+
+        for i, log in enumerate(logs):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log["timestamp"]))
+            trace = log.get("trace_id", "-") or "-"
+            msg = log["message"]
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            print(f"│ [{log['level']:<8}] {ts}  trace={trace:<12}  {msg}")
+
+        print(f"└{'─' * 100}")
+
+    def export_diagnostic_data(self, output_dir: Optional[str] = None,
+                               include_crash_dumps: bool = True) -> str:
+        """
+        一键导出诊断数据：缓冲区积压日志 + 崩溃转储，合并到一个文件。
+
+        导出内容包括：
+        1. 诊断头部信息（导出时间、Agent 状态、配置摘要）
+        2. 当前积压在缓冲区中尚未上报的日志
+        3. 正在上报重试中的日志
+        4. 未归档的崩溃转储文件中的日志（可选）
+
+        Args:
+            output_dir: 输出目录，None 则使用崩溃转储目录
+            include_crash_dumps: 是否包含未归档的崩溃转储
+
+        Returns:
+            导出文件的绝对路径
+        """
+        if output_dir is None:
+            output_dir = self._config.crash_dump_dir
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"diagnostic_export_{timestamp}_{os.getpid()}.jsonl"
+        filepath = os.path.abspath(os.path.join(output_dir, filename))
+
+        current_stats = self.get_status()
+
+        all_entries = []
+
+        pending_entries = self._reporter_worker.peek_all_pending()
+        for entry in pending_entries:
+            d = entry.to_dict()
+            d["_source"] = "pending"
+            all_entries.append(d)
+
+        if include_crash_dumps:
+            dump_files = self._crash_protector.list_dump_files()
+            for dump_file in dump_files:
+                full_path = os.path.join(self._config.crash_dump_dir, dump_file)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                                d["_source"] = f"crash_dump:{dump_file}"
+                                all_entries.append(d)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+
+        header = {
+            "_type": "diagnostic_header",
+            "export_time": time.time(),
+            "export_time_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "pid": os.getpid(),
+            "status": current_stats,
+            "config": {
+                "buffer_capacity": self._config.buffer_capacity,
+                "overflow_strategy": self._config.overflow_strategy,
+                "reporter_type": self._config.reporter_type,
+                "reporter_endpoint": self._config.reporter_endpoint,
+                "reporter_env": self._config.reporter_env,
+            },
+        }
+
+        target_info = None
+        if hasattr(self._reporter, "get_target_info"):
+            target_info = self._reporter.get_target_info()
+            header["target_info"] = target_info
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header, ensure_ascii=False) + "\n")
+
+            for entry in all_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            f.flush()
+            os.fsync(f.fileno())
+
+        logger.info(f"diagnostic data exported to {filepath}, "
+                    f"total {len(all_entries)} entries")
+        return filepath
 
     @property
     def buffer(self) -> RingBuffer:

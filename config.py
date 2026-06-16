@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 import time
 
 
@@ -16,6 +16,16 @@ class LogAgentConfig:
     reporter_type: str = "http"
 
     reporter_endpoint: str = "http://localhost:8080/logs"
+
+    reporter_env: str = "default"
+
+    reporter_headers: Dict[str, str] = field(default_factory=dict)
+
+    reporter_auth_token: Optional[str] = None
+
+    reporter_basic_auth: Optional[tuple] = None
+
+    reporter_connect_timeout_sec: float = 5.0
 
     reporter_batch_size: int = 100
 

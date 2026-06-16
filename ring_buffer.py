@@ -218,6 +218,32 @@ class RingBuffer:
             self._not_full.notify_all()
             return result
 
+    def peek(self, max_count: Optional[int] = None) -> list:
+        """
+        只读查看缓冲区中的数据，不移动指针，不消费数据。
+
+        Args:
+            max_count: 最多返回多少条，None 返回全部
+
+        Returns:
+            日志条目列表（按写入顺序，从最老到最新）
+        """
+        with self._lock:
+            if self._size == 0:
+                return []
+
+            count = min(max_count or self._size, self._size)
+            result = []
+
+            pos = self._read_pos
+            for _ in range(count):
+                item = self._buffer[pos]
+                if item is not None:
+                    result.append(item)
+                pos = (pos + 1) % self._capacity
+
+            return result
+
     def get_stats(self) -> dict:
         """获取统计信息。"""
         with self._lock:
