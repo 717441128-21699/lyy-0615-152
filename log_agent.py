@@ -11,6 +11,7 @@ from config import LogAgentConfig, LogEntry
 from reporter import ReporterWorker, HttpLogReporter, ConsoleLogReporter, LogReporter
 from crash_protector import CrashProtector
 from sample_controller import SampleController
+from management_server import ManagementServer
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ class LogAgent:
 
         self._sample_controller = SampleController()
 
+        self._management = ManagementServer(self)
+
         self._started = False
         self._start_lock = threading.Lock()
 
@@ -95,6 +98,7 @@ class LogAgent:
                 self._crash_protector.register(self._buffer, self._reporter_worker)
 
             self._reporter_worker.start()
+            self._management.start()
             self._started = True
             logger.info("log agent started")
 
@@ -105,12 +109,27 @@ class LogAgent:
                 return
             self._started = False
 
+        self._management.stop()
+
         if self._config.crash_dump_enabled:
             self._crash_protector.unregister()
 
         self._reporter_worker.stop(timeout=timeout)
         self._reporter.close()
         logger.info("log agent stopped")
+
+    @property
+    def management_url(self) -> Optional[str]:
+        """管理服务器地址（未启用或未启动成功返回 None。"""
+        port = self._management.actual_port
+        if port:
+            return self._management.base_url
+        return None
+
+    @property
+    def management_port(self) -> int:
+        """管理服务器实际监听端口，0 表示未启用。"""
+        return self._management.actual_port
 
     def log(self, level: str, message: str, trace_id: Optional[str] = None,
             extra: Optional[dict] = None, service: Optional[str] = None,
@@ -288,11 +307,58 @@ class LogAgent:
             uptime_str = f"{uptime:.1f} 秒"
 
         target = s.get("target", {})
-        target_desc = "N/A"
+        target_lines = []
         if target:
-            target_desc = f"[{target.get('env', '?')}] {target.get('endpoint', '?')}"
+            role = target.get("current_endpoint_role", "")
+            ep = target.get("current_endpoint", target.get("endpoint", "?"))
+            env = target.get("env", "?")
+            role_label = {"primary": "主地址", "backup#1": "备地址#1", "backup#2": "备地址#2"}.get(role, role)
+            header1 = f"[{env}] {ep}"
+            if role_label:
+                header1 += f"  ({role_label})"
             if target.get("consecutive_failures", 0) > 0:
-                target_desc += f"  [!] 连续失败 {target['consecutive_failures']} 次"
+                header1 += f"  [!] 连续失败 {target['consecutive_failures']} 次"
+            target_lines.append(header1)
+
+            # 主备切换信息
+            failover = target.get("failover", {})
+            if failover:
+                switch_count = failover.get("switch_count", 0)
+                if switch_count > 0:
+                    last_switch = failover.get("last_switch_time")
+                    last_reason = failover.get("last_switch_reason", "")
+                    switch_str = f"  累计切换 {switch_count} 次"
+                    if last_switch:
+                        ts = time.strftime("%H:%M:%S", time.localtime(last_switch))
+                        switch_str += f"，上次: {ts}"
+                    if last_reason:
+                        switch_str += f" ({last_reason})"
+                    target_lines.append(switch_str)
+
+                    # 恢复进度
+                    recover_needed = failover.get("recover_success_needed", 0)
+                    if role != "primary" and recover_needed > 0:
+                        current_streak = 0
+                        streak_map = failover.get("per_endpoint_success_streak", {})
+                        if ep in streak_map:
+                            current_streak = streak_map[ep]
+                        pct = min(100, int(current_streak / max(1, recover_needed) * 100))
+                        target_lines.append(f"  恢复主地址进度: {current_streak}/{recover_needed} ({pct}%)")
+
+                # 所有地址状态一览
+                all_eps = target.get("all_endpoints", [])
+                failures = failover.get("per_endpoint_failures", {})
+                if len(all_eps) > 1:
+                    eps_str_parts = []
+                    for i, e in enumerate(all_eps):
+                        tag = "*" if e == ep else " "
+                        f_cnt = failures.get(e, 0)
+                        label = "主" if i == 0 else f"备{i}"
+                        eps_str_parts.append(f"{tag}[{label}] {e} (失败{f_cnt})")
+                    target_lines.append("  全部目标: " + " | ".join(eps_str_parts))
+
+        if not target_lines:
+            target_lines = ["N/A"]
 
         buf_size = s["buffer"]["size"]
         buf_cap = s["buffer"]["capacity"]
@@ -310,17 +376,27 @@ class LogAgent:
             else:
                 drain_str = f" (预计 {drain_est} 秒排空)"
 
+        # 管理服务器信息
+        mgmt_port = self._management.actual_port
+        mgmt_line = ""
+        if mgmt_port:
+            mgmt_line = f"  管理端口: http://{self._config.management_host}:{mgmt_port}"
+
         _safe_print()
-        _safe_print("┌" + "─" * 78 + "┐")
+        _safe_print("┌" + "─" * 82 + "┐")
         _safe_print(f"│  LogAgent 运行状态   {running:<30}   运行时长: {uptime_str:<15}│")
-        _safe_print(f"│  上报目标: {target_desc:<67}│")
-        _safe_print("├" + "─" * 78 + "┤")
+        for i, tl in enumerate(target_lines):
+            prefix = "│  上报目标: " if i == 0 else "│            "
+            _safe_print(f"{prefix}{tl:<67}│")
+        if mgmt_line:
+            _safe_print(f"{mgmt_line:<50}│")
+        _safe_print("├" + "─" * 82 + "┤")
         _safe_print(f"│  [buffer] 缓冲区                     │  [thrpt] 吞吐")
         _safe_print(f"│     容量: {buf_cap:<10,}              │     累计写入: {s['throughput']['total_written']:>12,}")
         _safe_print(f"│     已用: {buf_size:<10,}              │     累计上报: {s['throughput']['total_reported']:>12,}")
         _safe_print(f"│     使用率: {buf_bar} {buf_pct:>5.1f}%     │     近期 QPS: {qps:>12,.1f}")
         _safe_print(f"│                                     │     平均 QPS: {s['throughput']['qps_avg']:>12,.1f}")
-        _safe_print("├" + "─" * 78 + "┤")
+        _safe_print("├" + "─" * 82 + "┤")
         _safe_print(f"│  [queued] 积压日志                    │  [error] 异常")
         _safe_print(f"│     总数: {backlog:<10,}  {drain_str:<20}│     溢出次数: {s['errors']['overflow_count']:>10,}")
         _safe_print(f"│     缓冲区内: {s['backlog']['in_buffer']:<8,}            │     丢弃总数: {s['errors']['total_dropped']:>10,}")
@@ -328,7 +404,7 @@ class LogAgent:
         _safe_print(f"│                                     │       丢最新: {s['errors']['dropped_newest']:>10,}")
         _safe_print(f"│                                     │     重试次数: {s['errors']['total_retries']:>10,}")
         _safe_print(f"│                                     │     上报失败: {s['throughput']['total_failed']:>10,}")
-        _safe_print("└" + "─" * 78 + "┘")
+        _safe_print("└" + "─" * 82 + "┘")
 
         if buf_pct > 80:
             _safe_print("  [!] 缓冲区使用率超过 80%，建议：")
@@ -343,6 +419,7 @@ class LogAgent:
     def query_logs(self, level: Optional[str] = None,
                    keyword: Optional[str] = None,
                    trace_id: Optional[str] = None,
+                   service: Optional[str] = None,
                    limit: int = 100,
                    order: str = "desc") -> List[dict]:
         """
@@ -350,14 +427,19 @@ class LogAgent:
 
         只读操作，不会影响日志上报流程。
 
+        注意：无论 order 选择升序还是降序，当 limit 小于积压量时，
+        永远优先取"最近写入的那一批日志"，然后再按 order 指定的方向排序。
+        这样 asc 模式下看的是"最近 5 条按时间线展开"，而不是"最早 5 条"。
+
         Args:
             level: 按级别过滤，如 "ERROR"、"WARN"；None 表示所有级别
             keyword: 按消息内容关键词过滤（大小写不敏感）
             trace_id: 按 trace_id 精确匹配
-            limit: 最多返回多少条，默认 100 条
+            service: 按服务名精确匹配
+            limit: 最多返回多少条，默认 100 条（优先取最近的 limit 条）
             order: 排序方式
-                   "desc" - 从新到旧（默认，优先看最新日志）
-                   "asc"  - 从旧到新（按时间线排查）
+                   "desc" - 从新到旧（默认）
+                   "asc"  - 从旧到新（最近一批按时间线展开）
 
         Returns:
             符合条件的日志字典列表，按指定顺序排序
@@ -381,19 +463,27 @@ class LogAgent:
             if trace_id and entry.trace_id != trace_id:
                 continue
 
+            if service and entry.service != service:
+                continue
+
             all_matched.append(entry.to_dict())
 
+        # 第一步：取最近 limit 条（切片尾部）
+        if len(all_matched) > limit:
+            all_matched = all_matched[-limit:]
+
+        # 第二步：按 order 排序
+        # entries 原始顺序是"从旧到新"（先写入的在前）
+        # all_matched 继承了这个顺序
         if order == "desc":
             all_matched.reverse()
-
-        if len(all_matched) > limit:
-            all_matched = all_matched[:limit]
 
         return all_matched
 
     def print_logs(self, level: Optional[str] = None,
                    keyword: Optional[str] = None,
                    trace_id: Optional[str] = None,
+                   service: Optional[str] = None,
                    limit: int = 50,
                    order: str = "desc"):
         """
@@ -401,7 +491,8 @@ class LogAgent:
         参数同 query_logs。
         """
         logs = self.query_logs(level=level, keyword=keyword,
-                               trace_id=trace_id, limit=limit, order=order)
+                               trace_id=trace_id, service=service,
+                               limit=limit, order=order)
 
         if not logs:
             _safe_print("(没有符合条件的未上报日志)")
@@ -409,21 +500,23 @@ class LogAgent:
 
         order_label = "从新到旧" if order == "desc" else "从旧到新"
         _safe_print(f"┌── 未上报日志查询结果（共 {len(logs)} 条，排序: {order_label}）")
-        _safe_print(f"│   过滤条件: level={level}, keyword={keyword}, trace_id={trace_id}")
+        _safe_print(f"│   过滤条件: level={level}, keyword={keyword}, trace_id={trace_id}, service={service}")
         _safe_print(f"├{'─' * 100}")
 
         for i, log in enumerate(logs):
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(log["timestamp"]))
             trace = log.get("trace_id", "-") or "-"
+            svc = log.get("service", "-") or "-"
             msg = log["message"]
-            if len(msg) > 80:
-                msg = msg[:77] + "..."
-            _safe_print(f"│ [{log['level']:<8}] {ts}  trace={trace:<12}  {msg}")
+            if len(msg) > 60:
+                msg = msg[:57] + "..."
+            _safe_print(f"│ [{log['level']:<8}] {ts}  svc={svc:<15} trace={trace:<12}  {msg}")
 
         _safe_print(f"└{'─' * 100}")
 
     def export_diagnostic_data(self, output_dir: Optional[str] = None,
-                               include_crash_dumps: bool = True) -> str:
+                               include_crash_dumps: bool = True,
+                               service: Optional[str] = None) -> str:
         """
         一键导出诊断数据：缓冲区积压日志 + 崩溃转储，合并到一个文件。
 
@@ -436,6 +529,7 @@ class LogAgent:
         Args:
             output_dir: 输出目录，None 则使用崩溃转储目录
             include_crash_dumps: 是否包含未归档的崩溃转储
+            service: 按服务名过滤导出，None 表示全部
 
         Returns:
             导出文件的绝对路径
@@ -497,6 +591,10 @@ class LogAgent:
         if hasattr(self._reporter, "get_target_info"):
             target_info = self._reporter.get_target_info()
             header["target_info"] = target_info
+
+        if service:
+            all_entries = [e for e in all_entries if e.get("service") == service]
+            header["filter_service"] = service
 
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(json.dumps(header, ensure_ascii=False) + "\n")

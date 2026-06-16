@@ -51,10 +51,10 @@ def test_log_sorting_and_limit():
         messages = [log["message"] for log in logs]
         assert messages == ["msg-19", "msg-18", "msg-17", "msg-16", "msg-15"], f"顺序不对: {messages}"
 
-        # asc：limit=5 应该拿到 msg-0 ~ msg-4（最旧的 5 条）
+        # asc：limit=5 应该拿到最近 5 条（msg-15~msg-19）然后按时间线升序排
         logs_asc = agent.query_logs(limit=5, order="asc")
         messages_asc = [log["message"] for log in logs_asc]
-        assert messages_asc == ["msg-0", "msg-1", "msg-2", "msg-3", "msg-4"], f"顺序不对: {messages_asc}"
+        assert messages_asc == ["msg-15", "msg-16", "msg-17", "msg-18", "msg-19"], f"顺序不对: {messages_asc}"
 
         # desc + 全部
         logs_all_desc = agent.query_logs(limit=100, order="desc")

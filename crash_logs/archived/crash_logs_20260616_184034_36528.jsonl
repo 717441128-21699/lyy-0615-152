@@ -1,0 +1,5 @@
+{"level": "INFO", "message": "test log 0", "timestamp": 1781606434.164922, "service": "default", "trace_id": null, "extra": {}}
+{"level": "INFO", "message": "test log 1", "timestamp": 1781606434.1649458, "service": "default", "trace_id": null, "extra": {}}
+{"level": "INFO", "message": "test log 2", "timestamp": 1781606434.1649525, "service": "default", "trace_id": null, "extra": {}}
+{"level": "INFO", "message": "test log 3", "timestamp": 1781606434.1649609, "service": "default", "trace_id": null, "extra": {}}
+{"level": "INFO", "message": "test log 4", "timestamp": 1781606434.1649654, "service": "default", "trace_id": null, "extra": {}}

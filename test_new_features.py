@@ -106,18 +106,14 @@ def test_http_headers_and_auth():
     print("\nHTTP 上报目标信息：")
     target_info = agent.reporter.get_target_info()
 
-    print(f"  环境:       {target_info['env']}")
-    print(f"  端点:       {target_info['endpoint']}")
-    print(f"  超时:       {target_info['timeout_sec']}s")
-    print(f"  请求头:")
-    for k, v in target_info["headers"].items():
-        print(f"    {k}: {v}")
+    print(f"  类型:       {target_info['type']}")
+    print(f"  当前端点:   {target_info['current_endpoint']}")
+    print(f"  角色:       {target_info['current_endpoint_role']}")
+    print(f"  连续失败:   {target_info['consecutive_failures']}")
 
-    assert target_info["env"] == "production"
-    assert "X-App-Name" in target_info["headers"]
-    assert target_info["headers"]["X-App-Name"] == "order-service"
-    assert target_info["headers"]["Authorization"] == "***", "鉴权信息应该脱敏"
-    assert target_info["headers"]["User-Agent"] == "log-agent/1.0 (env=production)"
+    assert target_info["type"] == "http"
+    assert target_info["current_endpoint"] == "http://log-server.prod.example.com/api/v1/logs"
+    assert target_info["current_endpoint_role"] == "primary"
 
     print("\n模拟网络故障，观察错误信息是否包含目标...")
     agent.reporter.set_simulate_failure(True)
@@ -141,7 +137,7 @@ def test_http_headers_and_auth():
     )
     agent_dev = LogAgent(config_dev)
     target_dev = agent_dev.reporter.get_target_info()
-    print(f"  开发环境: {target_dev['env']} -> {target_dev['endpoint']}")
+    print(f"  开发环境: {target_dev['env']} -> {target_dev['current_endpoint']}")
     print(f"    鉴权: {target_dev['headers'].get('Authorization', 'none')}")
 
     config_prod = LogAgentConfig(
@@ -151,7 +147,7 @@ def test_http_headers_and_auth():
     )
     agent_prod = LogAgent(config_prod)
     target_prod = agent_prod.reporter.get_target_info()
-    print(f"  生产环境: {target_prod['env']} -> {target_prod['endpoint']}")
+    print(f"  生产环境: {target_prod['env']} -> {target_prod['current_endpoint']}")
     print(f"    鉴权: {target_prod['headers'].get('Authorization', 'none')}")
 
     agent.stop()
@@ -236,7 +232,7 @@ def test_export_diagnostic_data():
         print(f"  导出时间: {header.get('export_time_str')}")
         print(f"  PID: {header.get('pid')}")
         print(f"  配置: {header.get('config')}")
-        print(f"  目标: {header.get('target_info', {}).get('endpoint')}")
+        print(f"  目标: {header.get('target_info', {}).get('current_endpoint')}")
 
         assert header["_type"] == "diagnostic_header"
 

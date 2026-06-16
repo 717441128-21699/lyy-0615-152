@@ -139,6 +139,7 @@ class HttpLogReporter(LogReporter):
             for k, v in self._headers.items()
         }
         return {
+            "type": "http",
             "current_endpoint": self._endpoint,
             "current_endpoint_role": "primary" if self._current_index == 0 else f"backup#{self._current_index}",
             "primary_endpoint": self._primary_endpoint,

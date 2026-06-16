@@ -49,6 +49,14 @@ class LogAgentConfig:
 
     metrics_report_interval_sec: int = 60
 
+    management_enabled: bool = True
+
+    management_host: str = "127.0.0.1"
+
+    management_port: int = 0  # 0 表示随机分配，实际端口通过 get_management_port() 获取
+
+    management_token: Optional[str] = None  # 可选的简单鉴权 token
+
 
 @dataclass
 class LogEntry:
