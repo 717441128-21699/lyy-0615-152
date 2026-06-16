@@ -1,6 +1,9 @@
 import threading
 import time
+import json
 import logging
+import urllib.request
+import urllib.error
 from typing import List, Optional
 from abc import ABC, abstractmethod
 
@@ -34,16 +37,24 @@ class HttpLogReporter(LogReporter):
     """
     HTTP 日志上报器。
 
-    实际项目中会使用真正的 HTTP 客户端，这里为了演示
-    模拟网络延迟和失败场景。
+    将批量日志以 JSON 数组形式 POST 到配置的 HTTP 端点。
+    请求体格式：
+    [
+      {"level": "INFO", "message": "...", "timestamp": 1234567890, ...},
+      ...
+    ]
+
+    支持真实网络故障模拟，便于测试。
     """
 
     def __init__(self, config: LogAgentConfig):
         self._endpoint = config.reporter_endpoint
+        self._timeout_sec = 5.0
         self._max_retries = config.reporter_max_retries
         self._retry_backoff_ms = config.reporter_retry_backoff_ms
+
         self._simulate_failure = False
-        self._simulate_delay_ms = 10
+        self._simulate_delay_ms = 0
 
     def set_simulate_failure(self, fail: bool):
         """模拟网络故障，用于测试。"""
@@ -54,13 +65,48 @@ class HttpLogReporter(LogReporter):
         self._simulate_delay_ms = delay_ms
 
     def report(self, entries: List[LogEntry]) -> bool:
+        """
+        上报一批日志。
+
+        真实发送 HTTP POST 请求，Content-Type: application/json。
+        返回 True 表示上报成功，False 表示失败。
+        """
         if self._simulate_delay_ms > 0:
             time.sleep(self._simulate_delay_ms / 1000.0)
 
         if self._simulate_failure:
             return False
 
-        return True
+        try:
+            payload = json.dumps([e.to_dict() for e in entries]).encode("utf-8")
+
+            req = urllib.request.Request(
+                self._endpoint,
+                data=payload,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "log-agent/1.0",
+                },
+            )
+
+            with urllib.request.urlopen(req, timeout=self._timeout_sec) as resp:
+                    status = resp.getcode()
+                    if 200 <= status < 300:
+                        return True
+                    else:
+                        logger.warning(f"http report got status {status}")
+                        return False
+
+        except urllib.error.HTTPError as e:
+            logger.warning(f"http report HTTP error: {e.code} {e.reason}")
+            return False
+        except urllib.error.URLError as e:
+            logger.warning(f"http report URL error: {e.reason}")
+            return False
+        except Exception as e:
+            logger.error(f"http report unexpected error: {e}")
+            return False
 
     def close(self):
         pass

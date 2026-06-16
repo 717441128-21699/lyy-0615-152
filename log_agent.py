@@ -87,17 +87,22 @@ class LogAgent:
                 return
             self._started = False
 
+        if self._config.crash_dump_enabled:
+            self._crash_protector.unregister()
+
         self._reporter_worker.stop(timeout=timeout)
         self._reporter.close()
         logger.info("log agent stopped")
 
     def log(self, level: str, message: str, trace_id: Optional[str] = None,
-            extra: Optional[dict] = None, service: Optional[str] = None) -> bool:
+            extra: Optional[dict] = None, service: Optional[str] = None,
+            block: bool = False, timeout: Optional[float] = None) -> str:
         """
         写一条日志。
 
-        这是业务线程调用的主要接口，仅将日志放入环形缓冲区，
-        耗时极短，几乎不会阻塞业务线程。
+        这是业务线程调用的主要接口。
+        默认非阻塞模式：仅将日志放入环形缓冲区，耗时极短，几乎不阻塞业务线程。
+        阻塞模式：缓冲区满时会等待空位，直到超时（仅 BLOCK 策略有效）。
 
         Args:
             level: 日志级别，如 DEBUG/INFO/WARN/ERROR
@@ -105,9 +110,14 @@ class LogAgent:
             trace_id: 追踪 ID
             extra: 额外字段
             service: 服务名
+            block: 是否阻塞等待空位（仅 BLOCK 策略有效）
+                   DROP_OLDEST / DROP_NEWEST 策略下，此参数无效，总是立即返回
+            timeout: 阻塞超时时间（秒），None 表示一直等
 
         Returns:
-            True 表示成功写入缓冲区，False 表示因缓冲区满而被丢弃
+            "success" - 写入成功
+            "dropped" - 被丢弃（缓冲区满）
+            "timeout" - 阻塞等待超时（仅 BLOCK + block=True 时可能返回）
         """
         entry = LogEntry(
             level=level,
@@ -117,13 +127,13 @@ class LogAgent:
             service=service or self._config.service if hasattr(self._config, 'service') else "default",
         )
 
-        success = self._buffer.put(entry, block=False)
+        result = self._buffer.put(entry, block=block, timeout=timeout)
 
-        if success:
+        if result == RingBuffer.PUT_SUCCESS:
             with self._stats_lock:
                 self._write_count += 1
 
-        return success
+        return result
 
     def debug(self, message: str, **kwargs):
         return self.log("DEBUG", message, **kwargs)

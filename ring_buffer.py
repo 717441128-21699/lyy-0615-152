@@ -16,11 +16,20 @@ class RingBuffer:
     - 生产者（业务线程）写入时仅持有锁极短时间（指针移动+数据拷贝）
     - 消费者（上报线程）批量读取，减少锁竞争
     - 支持三种满溢策略：丢弃最老、丢弃最新、阻塞
+
+    put() 返回值说明：
+    - PUT_SUCCESS: 写入成功
+    - PUT_DROPPED: 因缓冲区满被丢弃（丢弃最新 / 非阻塞模式）
+    - PUT_TIMEOUT: 阻塞等待超时，未能写入
     """
 
     DROP_OLDEST = "drop_oldest"
     DROP_NEWEST = "drop_newest"
     BLOCK = "block"
+
+    PUT_SUCCESS = "success"
+    PUT_DROPPED = "dropped"
+    PUT_TIMEOUT = "timeout"
 
     def __init__(self, capacity: int = 10000, overflow_strategy: str = DROP_OLDEST):
         if capacity <= 0:
@@ -69,17 +78,21 @@ class RingBuffer:
         with self._lock:
             return self._size == self._capacity
 
-    def put(self, item: Any, block: bool = True, timeout: Optional[float] = None) -> bool:
+    def put(self, item: Any, block: bool = True, timeout: Optional[float] = None) -> str:
         """
         写入一条日志。
 
         Args:
             item: 日志条目
             block: 缓冲区满时是否阻塞等待（仅 BLOCK 策略有效）
-            timeout: 阻塞超时时间（秒）
+                   DROP_OLDEST 和 DROP_NEWEST 策略下，此参数无效，
+                   总是立即返回，不阻塞业务线程。
+            timeout: 阻塞超时时间（秒），仅 BLOCK + block=True 时有效
 
         Returns:
-            True 表示写入成功，False 表示因缓冲区满而丢弃
+            PUT_SUCCESS: 写入成功
+            PUT_DROPPED: 因缓冲区满被丢弃
+            PUT_TIMEOUT: 阻塞等待超时（仅 BLOCK 策略 + block=True 时可能返回）
         """
         with self._lock:
             if self._size < self._capacity:
@@ -90,7 +103,7 @@ class RingBuffer:
             if strategy == self.DROP_NEWEST:
                 self._overflow_count += 1
                 self._dropped_newest_count += 1
-                return False
+                return self.PUT_DROPPED
 
             elif strategy == self.DROP_OLDEST:
                 self._do_drop_oldest()
@@ -99,19 +112,30 @@ class RingBuffer:
             else:  # BLOCK
                 if not block:
                     self._overflow_count += 1
-                    return False
-                self._not_full.wait(timeout=timeout)
-                if self._size >= self._capacity:
-                    self._overflow_count += 1
-                    return False
+                    return self.PUT_DROPPED
+
+                deadline = None
+                remaining = timeout
+                if timeout is not None:
+                    deadline = time.monotonic() + timeout
+
+                while self._size >= self._capacity:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._overflow_count += 1
+                            return self.PUT_TIMEOUT
+
+                    self._not_full.wait(timeout=remaining)
+
                 return self._do_put(item)
 
-    def _do_put(self, item: Any) -> bool:
+    def _do_put(self, item: Any) -> str:
         self._buffer[self._write_pos] = item
         self._write_pos = (self._write_pos + 1) % self._capacity
         self._size += 1
         self._not_empty.notify()
-        return True
+        return self.PUT_SUCCESS
 
     def _do_drop_oldest(self):
         if self._size > 0:

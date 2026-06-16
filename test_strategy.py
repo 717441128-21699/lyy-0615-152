@@ -3,6 +3,7 @@
 """
 
 import time
+import threading
 import sys
 import os
 
@@ -23,14 +24,14 @@ def test_drop_oldest():
 
     print("写入 5 条日志填满缓冲区...")
     for i in range(5):
-        success = buf.put(f"log-{i}")
-        assert success, f"log-{i} should be written"
+        result = buf.put(f"log-{i}")
+        assert result == RingBuffer.PUT_SUCCESS, f"log-{i} should be written"
     print(f"缓冲区大小: {len(buf)} / {buf.capacity}")
 
     print("\n继续写入 3 条新日志，应该覆盖最老的 3 条...")
     for i in range(5, 8):
-        success = buf.put(f"log-{i}")
-        assert success, f"log-{i} should be written"
+        result = buf.put(f"log-{i}")
+        assert result == RingBuffer.PUT_SUCCESS, f"log-{i} should be written (drop oldest)"
 
     print(f"缓冲区大小: {len(buf)} / {buf.capacity}")
     stats = buf.get_stats()
@@ -61,15 +62,15 @@ def test_drop_newest():
 
     print("写入 5 条日志填满缓冲区...")
     for i in range(5):
-        success = buf.put(f"log-{i}")
-        assert success
+        result = buf.put(f"log-{i}")
+        assert result == RingBuffer.PUT_SUCCESS
     print(f"缓冲区大小: {len(buf)} / {buf.capacity}")
 
     print("\n继续写入 3 条新日志，这些新日志应该被丢弃...")
     dropped = 0
     for i in range(5, 8):
-        success = buf.put(f"log-{i}")
-        if not success:
+        result = buf.put(f"log-{i}")
+        if result == RingBuffer.PUT_DROPPED:
             dropped += 1
     print(f"丢弃了 {dropped} 条新日志")
 
@@ -92,8 +93,8 @@ def test_drop_newest():
     print()
 
 
-def test_block_strategy():
-    """测试阻塞策略（非阻塞模式）。"""
+def test_block_non_blocking():
+    """测试阻塞策略的非阻塞写入模式。"""
     print("=" * 60)
     print("策略测试：阻塞 (Block) - 非阻塞写入模式")
     print("=" * 60)
@@ -102,27 +103,94 @@ def test_block_strategy():
 
     print("写入 5 条日志填满缓冲区...")
     for i in range(5):
-        success = buf.put(f"log-{i}", block=False)
-        assert success
+        result = buf.put(f"log-{i}", block=False)
+        assert result == RingBuffer.PUT_SUCCESS
     print(f"缓冲区大小: {len(buf)} / {buf.capacity}")
 
-    print("\n尝试以非阻塞方式写入，应该失败...")
-    success = buf.put("log-5", block=False)
-    assert not success, "非阻塞写入应该失败"
+    print("\n尝试以非阻塞方式写入，应该返回 PUT_DROPPED...")
+    result = buf.put("log-5", block=False)
+    assert result == RingBuffer.PUT_DROPPED, "非阻塞写入应该返回 dropped"
+    print(f"结果: {result}")
 
     stats = buf.get_stats()
     print(f"溢出次数: {stats['overflow_count']}")
-    print(f"写入成功: {not success}")
 
     print("\n消费一条后再写入...")
     item = buf.get()
     print(f"消费了: {item}")
 
-    success = buf.put("log-5", block=False)
-    assert success, "消费后应该能写入"
+    result = buf.put("log-5", block=False)
+    assert result == RingBuffer.PUT_SUCCESS, "消费后应该能写入"
     print("写入 log-5 成功")
 
-    print("\n✓ 阻塞策略验证通过")
+    print("\n✓ 阻塞策略（非阻塞模式）验证通过")
+    print()
+
+
+def test_block_with_timeout():
+    """测试阻塞策略带超时等待。"""
+    print("=" * 60)
+    print("策略测试：阻塞 (Block) - 带超时等待")
+    print("=" * 60)
+
+    buf = RingBuffer(capacity=5, overflow_strategy=RingBuffer.BLOCK)
+
+    print("填满缓冲区...")
+    for i in range(5):
+        buf.put(f"log-{i}", block=False)
+
+    print("\n启动一个线程，200ms 后消费一条日志...")
+
+    def consumer():
+        time.sleep(0.2)
+        item = buf.get()
+        print(f"  [消费者] 消费了: {item}")
+
+    t = threading.Thread(target=consumer)
+    t.start()
+
+    print("尝试阻塞写入，超时 500ms...")
+    t0 = time.time()
+    result = buf.put("log-new", block=True, timeout=0.5)
+    elapsed = time.time() - t0
+
+    print(f"结果: {result}")
+    print(f"等待时间: {elapsed*1000:.0f}ms")
+
+    assert result == RingBuffer.PUT_SUCCESS, "消费者腾出位置后应该写入成功"
+    assert elapsed >= 0.15, "应该等待了至少 150ms"
+
+    t.join()
+    print("\n✓ 阻塞超时等待（有数据消费）验证通过")
+    print()
+
+
+def test_block_timeout_expired():
+    """测试阻塞策略超时到期（没有消费）。"""
+    print("=" * 60)
+    print("策略测试：阻塞 (Block) - 超时到期失败")
+    print("=" * 60)
+
+    buf = RingBuffer(capacity=3, overflow_strategy=RingBuffer.BLOCK)
+
+    print("填满缓冲区...")
+    for i in range(3):
+        buf.put(f"log-{i}", block=False)
+
+    print("\n尝试阻塞写入，超时 200ms，没有消费者...")
+    t0 = time.time()
+    result = buf.put("log-new", block=True, timeout=0.2)
+    elapsed = time.time() - t0
+
+    print(f"结果: {result}")
+    print(f"等待时间: {elapsed*1000:.0f}ms")
+    print(f"缓冲区大小: {len(buf)}")
+
+    assert result == RingBuffer.PUT_TIMEOUT, "超时后应该返回 timeout"
+    assert elapsed >= 0.18, "应该等待了接近 200ms"
+    assert len(buf) == 3, "缓冲区仍然是满的"
+
+    print("\n✓ 阻塞超时到期验证通过")
     print()
 
 
@@ -154,6 +222,33 @@ def test_strategy_switch():
     print()
 
 
+def test_drop_strategies_never_block():
+    """验证丢弃策略永远不会阻塞业务线程。"""
+    print("=" * 60)
+    print("验证：丢弃最老/丢弃最新 策略绝不阻塞")
+    print("=" * 60)
+
+    for strategy_name, strategy in [
+        ("drop_oldest", RingBuffer.DROP_OLDEST),
+        ("drop_newest", RingBuffer.DROP_NEWEST),
+    ]:
+        buf = RingBuffer(capacity=10, overflow_strategy=strategy)
+
+        print(f"\n策略: {strategy_name}")
+
+        start = time.perf_counter()
+        for i in range(100000):
+            result = buf.put(f"log-{i}")
+            assert result in (RingBuffer.PUT_SUCCESS, RingBuffer.PUT_DROPPED)
+        elapsed = time.perf_counter() - start
+
+        print(f"  写入 10 万条，耗时 {elapsed:.3f}s，平均 {elapsed/100000*1e6:.2f} 微秒/条")
+        print(f"  缓冲区最终大小: {len(buf)}")
+
+    print("\n✓ 丢弃策略零阻塞验证通过")
+    print()
+
+
 def test_full_agent_with_strategy():
     """测试完整 Agent 与策略配合。"""
     print("=" * 60)
@@ -174,8 +269,11 @@ def test_full_agent_with_strategy():
     agent.start()
 
     print("模拟网络故障，写入 200 条日志...")
+    success_count = 0
     for i in range(200):
-        agent.info(f"log-{i}")
+        result = agent.info(f"log-{i}")
+        if result == "success":
+            success_count += 1
 
     time.sleep(0.1)
 
@@ -203,8 +301,11 @@ def test_full_agent_with_strategy():
 if __name__ == "__main__":
     test_drop_oldest()
     test_drop_newest()
-    test_block_strategy()
+    test_block_non_blocking()
+    test_block_with_timeout()
+    test_block_timeout_expired()
     test_strategy_switch()
+    test_drop_strategies_never_block()
     test_full_agent_with_strategy()
 
     print("=" * 60)

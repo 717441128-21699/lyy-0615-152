@@ -32,6 +32,7 @@ class CrashProtector:
 
     def __init__(self, dump_dir: str = "./crash_logs"):
         self._dump_dir = dump_dir
+        self._archived_dir = os.path.join(dump_dir, "archived")
         self._dump_file: Optional[str] = None
         self._buffer_ref = None
         self._reporter_worker_ref = None
@@ -44,6 +45,7 @@ class CrashProtector:
     def _ensure_dump_dir(self):
         try:
             os.makedirs(self._dump_dir, exist_ok=True)
+            os.makedirs(self._archived_dir, exist_ok=True)
         except Exception as e:
             logger.error(f"failed to create crash dump dir: {e}")
 
@@ -61,11 +63,35 @@ class CrashProtector:
         self._buffer_ref = ring_buffer
         self._reporter_worker_ref = reporter_worker
 
+        self._prev_handlers = {}
         self._register_signals()
+
         atexit.register(self._on_exit)
+        self._atexit_registered = True
 
         self._registered = True
         logger.info("crash protector registered")
+
+    def unregister(self):
+        """取消注册崩溃保护，清理信号和 atexit 钩子。"""
+        if not self._registered:
+            return
+
+        for sig, prev_handler in getattr(self, '_prev_handlers', {}).items():
+            try:
+                signal.signal(sig, prev_handler)
+            except (ValueError, OSError):
+                pass
+
+        if getattr(self, '_atexit_registered', False):
+            try:
+                atexit.unregister(self._on_exit)
+            except Exception:
+                pass
+            self._atexit_registered = False
+
+        self._registered = False
+        logger.info("crash protector unregistered")
 
     def _register_signals(self):
         signals = [
@@ -82,9 +108,11 @@ class CrashProtector:
         if hasattr(signal, "SIGILL"):
             signals.append(signal.SIGILL)
 
+        self._prev_handlers = {}
         for sig in signals:
             try:
-                signal.signal(sig, self._signal_handler)
+                prev = signal.signal(sig, self._signal_handler)
+                self._prev_handlers[sig] = prev
             except (ValueError, OSError):
                 pass
 
@@ -177,9 +205,15 @@ class CrashProtector:
                 pass
         return count
 
-    def recover_latest_dump(self) -> List[LogEntry]:
+    def recover_latest_dump(self, auto_archive: bool = True) -> List[LogEntry]:
         """
         从最近的崩溃转储文件中恢复日志。
+
+        恢复成功后，默认会将转储文件移动到 archived/ 目录，
+        确保同一份转储文件不会被反复恢复。
+
+        Args:
+            auto_archive: 是否自动归档已恢复的转储文件
 
         Returns:
             恢复的日志条目列表
@@ -191,13 +225,15 @@ class CrashProtector:
             dump_files = [
                 f for f in os.listdir(self._dump_dir)
                 if f.startswith("crash_logs_") and f.endswith(".jsonl")
+                and not f.startswith(".")
             ]
 
             if not dump_files:
                 return []
 
             dump_files.sort(reverse=True)
-            latest_file = os.path.join(self._dump_dir, dump_files[0])
+            latest_filename = dump_files[0]
+            latest_file = os.path.join(self._dump_dir, latest_filename)
 
             entries = []
             with open(latest_file, "r", encoding="utf-8") as f:
@@ -222,14 +258,37 @@ class CrashProtector:
             if entries:
                 logger.info(f"recovered {len(entries)} logs from {latest_file}")
 
+                if auto_archive:
+                    self._archive_file(latest_file)
+                    logger.info(f"archived crash dump: {latest_filename}")
+
             return entries
 
         except Exception as e:
             logger.error(f"recover crash dump failed: {e}")
             return []
 
+    def _archive_file(self, filepath: str):
+        """将转储文件移动到归档目录。"""
+        try:
+            if not os.path.isfile(filepath):
+                return
+
+            filename = os.path.basename(filepath)
+            archived_path = os.path.join(self._archived_dir, filename)
+
+            if os.path.exists(archived_path):
+                base, ext = os.path.splitext(filename)
+                archived_path = os.path.join(
+                    self._archived_dir, f"{base}_{int(time.time())}{ext}"
+                )
+
+            os.rename(filepath, archived_path)
+        except Exception as e:
+            logger.warning(f"failed to archive crash dump: {e}")
+
     def list_dump_files(self) -> List[str]:
-        """列出所有崩溃转储文件。"""
+        """列出所有未归档的崩溃转储文件。"""
         try:
             if not os.path.isdir(self._dump_dir):
                 return []
@@ -241,21 +300,40 @@ class CrashProtector:
         except Exception:
             return []
 
-    def cleanup_old_dumps(self, keep_days: int = 7):
-        """清理旧的崩溃转储文件。"""
+    def list_archived_files(self) -> List[str]:
+        """列出所有已归档的崩溃转储文件。"""
         try:
-            if not os.path.isdir(self._dump_dir):
-                return
+            if not os.path.isdir(self._archived_dir):
+                return []
+            files = [
+                f for f in os.listdir(self._archived_dir)
+                if f.startswith("crash_logs_") and f.endswith(".jsonl")
+            ]
+            return sorted(files, reverse=True)
+        except Exception:
+            return []
+
+    def cleanup_old_dumps(self, keep_days: int = 7, include_archived: bool = True):
+        """清理旧的崩溃转储文件（包括归档目录）。"""
+        try:
+            dirs = [self._dump_dir]
+            if include_archived:
+                dirs.append(self._archived_dir)
+
             cutoff = time.time() - keep_days * 86400
-            for filename in os.listdir(self._dump_dir):
-                if not (filename.startswith("crash_logs_") and filename.endswith(".jsonl")):
+
+            for dump_dir in dirs:
+                if not os.path.isdir(dump_dir):
                     continue
-                filepath = os.path.join(self._dump_dir, filename)
-                try:
-                    mtime = os.path.getmtime(filepath)
-                    if mtime < cutoff:
-                        os.remove(filepath)
-                except Exception:
-                    continue
+                for filename in os.listdir(dump_dir):
+                    if not (filename.startswith("crash_logs_") and filename.endswith(".jsonl")):
+                        continue
+                    filepath = os.path.join(dump_dir, filename)
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        if mtime < cutoff:
+                            os.remove(filepath)
+                    except Exception:
+                        continue
         except Exception:
             pass
